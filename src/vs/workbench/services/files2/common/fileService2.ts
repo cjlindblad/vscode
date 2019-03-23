@@ -358,6 +358,20 @@ export class FileService2 extends Disposable implements IFileService {
 		return fileStat;
 	}
 
+	async copyFile(source: URI, target: URI, overwrite?: boolean): Promise<IFileStatWithMetadata> {
+		const sourceProvider = await this.withProvider(source);
+		const targetProvider = this.throwIfFileSystemIsReadonly(await this.withProvider(target));
+
+		// copy
+		await this.doMoveCopy(sourceProvider, source, targetProvider, target, 'copy', overwrite);
+
+		// resolve and send events
+		const fileStat = await this.resolveFile(target, { resolveMetadata: true });
+		this._onAfterOperation.fire(new FileOperationEvent(source, FileOperation.COPY, fileStat));
+
+		return fileStat;
+	}
+
 	private async doMoveCopy(sourceProvider: IFileSystemProvider, source: URI, targetProvider: IFileSystemProvider, target: URI, mode: 'move' | 'copy', overwrite?: boolean): Promise<void> {
 
 		// validation
@@ -384,11 +398,6 @@ export class FileService2 extends Disposable implements IFileService {
 				return this.doPipeBuffered(sourceProvider, source, targetProvider, target);
 			}
 
-			// copy: source (unbuffered) => target (unbuffered)
-			if (hasReadWriteCapability(sourceProvider) && hasReadWriteCapability(targetProvider)) {
-				return this.doPipeUnbuffered(sourceProvider, source, targetProvider, target, !!overwrite);
-			}
-
 			// copy: source (buffered) => target (unbuffered)
 			if (hasOpenReadWriteCloseCapability(sourceProvider) && hasReadWriteCapability(targetProvider)) {
 				return this.doPipeBufferedToUnbuffered(sourceProvider, source, targetProvider, target, !!overwrite);
@@ -397,6 +406,11 @@ export class FileService2 extends Disposable implements IFileService {
 			// copy: source (unbuffered) => target (buffered)
 			if (hasReadWriteCapability(sourceProvider) && hasOpenReadWriteCloseCapability(targetProvider)) {
 				return this.doPipeUnbufferedToBuffered(sourceProvider, source, targetProvider, target);
+			}
+
+			// copy: source (unbuffered) => target (unbuffered)
+			if (hasReadWriteCapability(sourceProvider) && hasReadWriteCapability(targetProvider)) {
+				return this.doPipeUnbuffered(sourceProvider, source, targetProvider, target, !!overwrite);
 			}
 
 			// give up if provider has insufficient capabilities
@@ -421,10 +435,10 @@ export class FileService2 extends Disposable implements IFileService {
 	}
 
 	private async doValidateMoveCopy(sourceProvider: IFileSystemProvider, source: URI, targetProvider: IFileSystemProvider, target: URI, overwrite?: boolean): Promise<{ exists: boolean, isCaseChange: boolean }> {
-
-		// Check if source is equal or parent to target
 		let isCaseChange = false;
 		let isPathCaseSensitive = false;
+
+		// Check if source is equal or parent to target (requires providers to be the same)
 		if (sourceProvider === targetProvider) {
 			const isPathCaseSensitive = !!(sourceProvider.capabilities & FileSystemProviderCapabilities.PathCaseSensitive);
 			isCaseChange = isPathCaseSensitive ? false : isEqual(source, target, true /* ignore case */);
@@ -433,6 +447,7 @@ export class FileService2 extends Disposable implements IFileService {
 			}
 		}
 
+		// Extra checks if target exists and this is not a rename
 		const exists = await this.existsFile(target);
 		if (exists && !isCaseChange) {
 
@@ -449,20 +464,6 @@ export class FileService2 extends Disposable implements IFileService {
 		}
 
 		return { exists, isCaseChange };
-	}
-
-	async copyFile(source: URI, target: URI, overwrite?: boolean): Promise<IFileStatWithMetadata> {
-		const sourceProvider = await this.withProvider(source);
-		const targetProvider = this.throwIfFileSystemIsReadonly(await this.withProvider(target));
-
-		// copy
-		await this.doMoveCopy(sourceProvider, source, targetProvider, target, 'copy', overwrite);
-
-		// resolve and send events
-		const fileStat = await this.resolveFile(target, { resolveMetadata: true });
-		this._onAfterOperation.fire(new FileOperationEvent(source, FileOperation.COPY, fileStat));
-
-		return fileStat;
 	}
 
 	async createFolder(resource: URI): Promise<IFileStatWithMetadata> {
@@ -567,6 +568,14 @@ export class FileService2 extends Disposable implements IFileService {
 		return provider.close(handle);
 	}
 
+	private async doWriteBuffer(provider: IFileSystemProviderWithOpenReadWriteCloseCapability, handle: number, buffer: Uint8Array, length: number, posInFile: number, posInBuffer: number): Promise<void> {
+		let totalBytesWritten = 0;
+		while (totalBytesWritten < length) {
+			const bytesWritten = await provider.write(handle, posInFile + totalBytesWritten, buffer, posInBuffer + totalBytesWritten, length - totalBytesWritten);
+			totalBytesWritten += bytesWritten;
+		}
+	}
+
 	private async doWriteUnbuffered(provider: IFileSystemProviderWithFileReadWriteCapability, resource: URI, buffer: Uint8Array, overwrite: boolean): Promise<void> {
 		return provider.writeFile(resource, buffer, { create: true, overwrite });
 	}
@@ -618,7 +627,7 @@ export class FileService2 extends Disposable implements IFileService {
 
 		// Read entire buffer from source and write buffered
 		const buffer = await sourceProvider.readFile(source);
-		await this.doWriteBuffer(targetProvider, targetHandle, await sourceProvider.readFile(source), buffer.byteLength, 0, 0);
+		await this.doWriteBuffer(targetProvider, targetHandle, buffer, buffer.byteLength, 0, 0);
 
 		// Close handle
 		return targetProvider.close(targetHandle);
@@ -649,14 +658,6 @@ export class FileService2 extends Disposable implements IFileService {
 
 		// Close handle
 		return sourceProvider.close(sourceHandle);
-	}
-
-	private async doWriteBuffer(provider: IFileSystemProviderWithOpenReadWriteCloseCapability, handle: number, buffer: Uint8Array, length: number, posInFile: number, posInBuffer: number): Promise<void> {
-		let totalBytesWritten = 0;
-		while (totalBytesWritten < length) {
-			const bytesWritten = await provider.write(handle, posInFile + totalBytesWritten, buffer, posInBuffer + totalBytesWritten, length - totalBytesWritten);
-			totalBytesWritten += bytesWritten;
-		}
 	}
 
 	private throwIfFileSystemIsReadonly(provider: IFileSystemProvider): IFileSystemProvider {
