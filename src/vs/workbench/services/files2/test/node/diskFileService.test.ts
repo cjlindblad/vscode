@@ -489,6 +489,59 @@ suite('Disk File Service', () => {
 		assert.equal(event!.target!.resource.fsPath, renamed.resource.fsPath);
 	});
 
+	test('moveFile - directory - across providers (buffered => buffered)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+		setCapabilities(testProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+
+		await testMoveFolderAcrossProviders();
+	});
+
+	test('moveFile - directory - across providers (unbuffered => unbuffered)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileReadWrite);
+		setCapabilities(testProvider, FileSystemProviderCapabilities.FileReadWrite);
+
+		await testMoveFolderAcrossProviders();
+	});
+
+	test('moveFile - directory - across providers (buffered => unbuffered)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+		setCapabilities(testProvider, FileSystemProviderCapabilities.FileReadWrite);
+
+		await testMoveFolderAcrossProviders();
+	});
+
+	test('moveFile - directory - across providers (unbuffered => buffered)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileReadWrite);
+		setCapabilities(testProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+
+		await testMoveFolderAcrossProviders();
+	});
+
+	async function testMoveFolderAcrossProviders(): Promise<void> {
+		let event: FileOperationEvent;
+		disposables.push(service.onAfterOperation(e => event = e));
+
+		const source = URI.file(join(testDir, 'deep'));
+		const sourceChildren = readdirSync(source.fsPath);
+
+		const target = URI.file(join(dirname(source.fsPath), 'deeper')).with({ scheme: testSchema });
+
+		const renamed = await service.moveFile(source, target);
+
+		assert.equal(existsSync(renamed.resource.fsPath), true);
+		assert.equal(existsSync(source.fsPath), false);
+		assert.ok(event!);
+		assert.equal(event!.resource.fsPath, source.fsPath);
+		assert.equal(event!.operation, FileOperation.MOVE);
+		assert.equal(event!.target!.resource.fsPath, renamed.resource.fsPath);
+
+		const targetChildren = readdirSync(target.fsPath);
+		assert.equal(sourceChildren.length, targetChildren.length);
+		for (let i = 0; i < sourceChildren.length; i++) {
+			assert.equal(sourceChildren[i], targetChildren[i]);
+		}
+	}
+
 	test('moveFile - MIX CASE', async () => {
 		let event: FileOperationEvent;
 		disposables.push(service.onAfterOperation(e => event = e));

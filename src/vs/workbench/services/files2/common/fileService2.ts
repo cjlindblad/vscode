@@ -393,28 +393,22 @@ export class FileService2 extends Disposable implements IFileService {
 				return sourceProvider.copy(source, target, { overwrite: !!overwrite });
 			}
 
-			// copy: source (buffered) => target (buffered)
-			if (hasOpenReadWriteCloseCapability(sourceProvider) && hasOpenReadWriteCloseCapability(targetProvider)) {
-				return this.doPipeBuffered(sourceProvider, source, targetProvider, target);
+			// otherwise, ensure we got the capabilities to do this
+			if (
+				!(hasOpenReadWriteCloseCapability(sourceProvider) || hasReadWriteCapability(sourceProvider)) ||
+				!(hasOpenReadWriteCloseCapability(targetProvider) || hasReadWriteCapability(targetProvider))
+			) {
+				return Promise.reject('Provider neither has FileReadWrite nor FileOpenReadWriteClose capability which is needed to support copy.');
 			}
 
-			// copy: source (buffered) => target (unbuffered)
-			if (hasOpenReadWriteCloseCapability(sourceProvider) && hasReadWriteCapability(targetProvider)) {
-				return this.doPipeBufferedToUnbuffered(sourceProvider, source, targetProvider, target, !!overwrite);
+			// when copying via buffer/unbuffered, we have to manually
+			// traverse the source if it is a folder and not a file
+			const sourceFile = await this.resolveFile(source);
+			if (sourceFile.isDirectory) {
+				return this.doCopyFolder(sourceProvider, sourceFile, targetProvider, target, overwrite);
+			} else {
+				return this.doCopyFile(sourceProvider, source, targetProvider, target, overwrite);
 			}
-
-			// copy: source (unbuffered) => target (buffered)
-			if (hasReadWriteCapability(sourceProvider) && hasOpenReadWriteCloseCapability(targetProvider)) {
-				return this.doPipeUnbufferedToBuffered(sourceProvider, source, targetProvider, target);
-			}
-
-			// copy: source (unbuffered) => target (unbuffered)
-			if (hasReadWriteCapability(sourceProvider) && hasReadWriteCapability(targetProvider)) {
-				return this.doPipeUnbuffered(sourceProvider, source, targetProvider, target, !!overwrite);
-			}
-
-			// give up if provider has insufficient capabilities
-			return Promise.reject('Provider neither has FileReadWrite nor FileOpenReadWriteClose capability which is needed to support copy.');
 		}
 
 		// move source => target
@@ -431,6 +425,47 @@ export class FileService2 extends Disposable implements IFileService {
 
 				return this.del(source, { recursive: true });
 			}
+		}
+	}
+
+	private async doCopyFile(sourceProvider: IFileSystemProvider, source: URI, targetProvider: IFileSystemProvider, target: URI, overwrite?: boolean): Promise<void> {
+
+		// copy: source (buffered) => target (buffered)
+		if (hasOpenReadWriteCloseCapability(sourceProvider) && hasOpenReadWriteCloseCapability(targetProvider)) {
+			return this.doPipeBuffered(sourceProvider, source, targetProvider, target);
+		}
+
+		// copy: source (buffered) => target (unbuffered)
+		if (hasOpenReadWriteCloseCapability(sourceProvider) && hasReadWriteCapability(targetProvider)) {
+			return this.doPipeBufferedToUnbuffered(sourceProvider, source, targetProvider, target, !!overwrite);
+		}
+
+		// copy: source (unbuffered) => target (buffered)
+		if (hasReadWriteCapability(sourceProvider) && hasOpenReadWriteCloseCapability(targetProvider)) {
+			return this.doPipeUnbufferedToBuffered(sourceProvider, source, targetProvider, target);
+		}
+
+		// copy: source (unbuffered) => target (unbuffered)
+		if (hasReadWriteCapability(sourceProvider) && hasReadWriteCapability(targetProvider)) {
+			return this.doPipeUnbuffered(sourceProvider, source, targetProvider, target, !!overwrite);
+		}
+	}
+
+	private async doCopyFolder(sourceProvider: IFileSystemProvider, sourceFolder: IFileStat, targetProvider: IFileSystemProvider, targetFolder: URI, overwrite?: boolean): Promise<void> {
+
+		// create folder in target
+		await targetProvider.mkdir(targetFolder);
+
+		// create children in target
+		if (Array.isArray(sourceFolder.children)) {
+			await Promise.all(sourceFolder.children.map(async sourceChild => {
+				const targetChild = joinPath(targetFolder, sourceChild.name);
+				if (sourceChild.isDirectory) {
+					return this.doCopyFolder(sourceProvider, await this.resolveFile(sourceChild.resource), targetProvider, targetChild, overwrite);
+				} else {
+					return this.doCopyFile(sourceProvider, sourceChild.resource, targetProvider, targetChild, overwrite);
+				}
+			}));
 		}
 	}
 
