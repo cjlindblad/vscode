@@ -14,14 +14,10 @@ import { join, basename, dirname, posix } from 'vs/base/common/path';
 import { getPathFromAmdModule } from 'vs/base/common/amd';
 import { copy, del } from 'vs/base/node/pfs';
 import { URI } from 'vs/base/common/uri';
-import { existsSync, statSync, readdirSync } from 'fs';
-import { FileOperation, FileOperationEvent, IFileStat, FileOperationResult } from 'vs/platform/files/common/files';
-import { FileService } from 'vs/workbench/services/files/node/fileService';
-import { TestContextService, TestEnvironmentService, TestTextResourceConfigurationService, TestLifecycleService, TestStorageService } from 'vs/workbench/test/workbenchTestServices';
-import { Workspace, toWorkspaceFolders } from 'vs/platform/workspace/common/workspace';
-import { TestConfigurationService } from 'vs/platform/configuration/test/common/testConfigurationService';
-import { TestNotificationService } from 'vs/platform/notification/test/common/testNotificationService';
+import { existsSync, statSync, readdirSync, readFileSync } from 'fs';
+import { FileOperation, FileOperationEvent, IFileStat, FileOperationResult, FileSystemProviderCapabilities } from 'vs/platform/files/common/files';
 import { NullLogService } from 'vs/platform/log/common/log';
+import { isLinux } from 'vs/base/common/platform';
 
 function getByName(root: IFileStat, name: string): IFileStat | null {
 	if (root.children === undefined) {
@@ -37,25 +33,53 @@ function getByName(root: IFileStat, name: string): IFileStat | null {
 	return null;
 }
 
+export class TestDiskFileSystemProvider extends DiskFileSystemProvider {
+
+	private _testCapabilities: FileSystemProviderCapabilities;
+	get capabilities(): FileSystemProviderCapabilities {
+		if (!this._testCapabilities) {
+			this._testCapabilities =
+				FileSystemProviderCapabilities.FileReadWrite |
+				FileSystemProviderCapabilities.FileOpenReadWriteClose |
+				FileSystemProviderCapabilities.FileFolderCopy;
+
+			if (isLinux) {
+				this._testCapabilities |= FileSystemProviderCapabilities.PathCaseSensitive;
+			}
+		}
+
+		return this._testCapabilities;
+	}
+
+	set capabilities(capabilities: FileSystemProviderCapabilities) {
+		this._testCapabilities = capabilities;
+	}
+}
+
 suite('Disk File Service', () => {
 
 	const parentDir = getRandomTestPath(tmpdir(), 'vsctests', 'diskfileservice');
+	const testSchema = 'test';
 
 	let service: FileService2;
+	let fileProvider: TestDiskFileSystemProvider;
+	let testProvider: TestDiskFileSystemProvider;
 	let testDir: string;
 
 	setup(async () => {
 		service = new FileService2(new NullLogService());
-		service.registerProvider(Schemas.file, new DiskFileSystemProvider());
+
+		fileProvider = new TestDiskFileSystemProvider();
+		service.registerProvider(Schemas.file, fileProvider);
+
+		testProvider = new TestDiskFileSystemProvider();
+		service.registerProvider(testSchema, testProvider);
 
 		const id = generateUuid();
 		testDir = join(parentDir, id);
 		const sourceDir = getPathFromAmdModule(require, './fixtures/service');
 
 		await copy(sourceDir, testDir);
-
-		const legacyService = new FileService(new TestContextService(new Workspace(testDir, toWorkspaceFolders([{ path: testDir }]))), TestEnvironmentService, new TestTextResourceConfigurationService(), new TestConfigurationService(), new TestLifecycleService(), new TestStorageService(), new TestNotificationService(), { disableWatcher: true });
-		service.setLegacyService(legacyService);
 	});
 
 	teardown(async () => {
@@ -336,28 +360,35 @@ suite('Disk File Service', () => {
 		}
 	});
 
-	test('renameFile', async () => {
+	test('moveFile', async () => {
 		let event: FileOperationEvent;
 		const toDispose = service.onAfterOperation(e => {
 			event = e;
 		});
 
-		const resource = URI.file(join(testDir, 'index.html'));
-		const source = await service.resolveFile(resource);
+		const source = URI.file(join(testDir, 'index.html'));
+		const sourceContents = readFileSync(source.fsPath);
 
-		const renamed = await service.moveFile(source.resource, URI.file(join(dirname(source.resource.fsPath), 'other.html')));
+		const target = URI.file(join(dirname(source.fsPath), 'other.html'));
+
+		const renamed = await service.moveFile(source, target);
 
 		assert.equal(existsSync(renamed.resource.fsPath), true);
-		assert.equal(existsSync(source.resource.fsPath), false);
+		assert.equal(existsSync(source.fsPath), false);
 		assert.ok(event!);
-		assert.equal(event!.resource.fsPath, resource.fsPath);
+		assert.equal(event!.resource.fsPath, source.fsPath);
 		assert.equal(event!.operation, FileOperation.MOVE);
 		assert.equal(event!.target!.resource.fsPath, renamed.resource.fsPath);
+
+		const targetContents = readFileSync(target.fsPath);
+
+		assert.equal(sourceContents.byteLength, targetContents.byteLength);
+		assert.equal(sourceContents.toString(), targetContents.toString());
 
 		toDispose.dispose();
 	});
 
-	test('renameFile - multi folder', async () => {
+	test('moveFile - multi folder', async () => {
 		let event: FileOperationEvent;
 		const toDispose = service.onAfterOperation(e => {
 			event = e;
@@ -366,79 +397,54 @@ suite('Disk File Service', () => {
 		const multiFolderPaths = ['a', 'couple', 'of', 'folders'];
 		const renameToPath = join(...multiFolderPaths, 'other.html');
 
-		const resource = URI.file(join(testDir, 'index.html'));
-		const source = await service.resolveFile(resource);
+		const source = URI.file(join(testDir, 'index.html'));
 
-		const renamed = await service.moveFile(source.resource, URI.file(join(dirname(source.resource.fsPath), renameToPath)));
+		const renamed = await service.moveFile(source, URI.file(join(dirname(source.fsPath), renameToPath)));
 
 		assert.equal(existsSync(renamed.resource.fsPath), true);
-		assert.equal(existsSync(source.resource.fsPath), false);
+		assert.equal(existsSync(source.fsPath), false);
 		assert.ok(event!);
-		assert.equal(event!.resource.fsPath, resource.fsPath);
+		assert.equal(event!.resource.fsPath, source.fsPath);
 		assert.equal(event!.operation, FileOperation.MOVE);
 		assert.equal(event!.target!.resource.fsPath, renamed.resource.fsPath);
 
 		toDispose.dispose();
 	});
 
-	test('renameFolder', async () => {
+	test('moveFile - directory', async () => {
 		let event: FileOperationEvent;
 		const toDispose = service.onAfterOperation(e => {
 			event = e;
 		});
 
-		const resource = URI.file(join(testDir, 'deep'));
-		const source = await service.resolveFile(resource);
+		const source = URI.file(join(testDir, 'deep'));
 
-		const renamed = await service.moveFile(source.resource, URI.file(join(dirname(source.resource.fsPath), 'deeper')));
+		const renamed = await service.moveFile(source, URI.file(join(dirname(source.fsPath), 'deeper')));
 
 		assert.equal(existsSync(renamed.resource.fsPath), true);
-		assert.equal(existsSync(source.resource.fsPath), false);
+		assert.equal(existsSync(source.fsPath), false);
 		assert.ok(event!);
-		assert.equal(event!.resource.fsPath, resource.fsPath);
+		assert.equal(event!.resource.fsPath, source.fsPath);
 		assert.equal(event!.operation, FileOperation.MOVE);
 		assert.equal(event!.target!.resource.fsPath, renamed.resource.fsPath);
 
 		toDispose.dispose();
 	});
 
-	test('renameFolder - multi folder', async () => {
+	test('moveFile - MIX CASE', function () {
 		let event: FileOperationEvent;
 		const toDispose = service.onAfterOperation(e => {
 			event = e;
 		});
 
-		const multiFolderPaths = ['a', 'couple', 'of', 'folders'];
-		const renameToPath = join(...multiFolderPaths);
-
-		const resource = URI.file(join(testDir, 'deep'));
-		const source = await service.resolveFile(resource);
-
-		const renamed = await service.moveFile(source.resource, URI.file(join(dirname(source.resource.fsPath), renameToPath)));
-
-		assert.equal(existsSync(renamed.resource.fsPath), true);
-		assert.equal(existsSync(source.resource.fsPath), false);
-		assert.ok(event!);
-		assert.equal(event!.resource.fsPath, resource.fsPath);
-		assert.equal(event!.operation, FileOperation.MOVE);
-		assert.equal(event!.target!.resource.fsPath, renamed.resource.fsPath);
-
-		toDispose.dispose();
-	});
-	test('renameFile - MIX CASE', function () {
-		let event: FileOperationEvent;
-		const toDispose = service.onAfterOperation(e => {
-			event = e;
-		});
-
-		const resource = URI.file(join(testDir, 'index.html'));
-		return service.resolveFile(resource).then(source => {
-			return service.moveFile(source.resource, URI.file(join(dirname(source.resource.fsPath), 'INDEX.html'))).then(renamed => {
+		const source = URI.file(join(testDir, 'index.html'));
+		return service.resolveFile(source).then(() => {
+			return service.moveFile(source, URI.file(join(dirname(source.fsPath), 'INDEX.html'))).then(renamed => {
 				assert.equal(existsSync(renamed.resource.fsPath), true);
 				assert.equal(basename(renamed.resource.fsPath), 'INDEX.html');
 
 				assert.ok(event);
-				assert.equal(event.resource.fsPath, resource.fsPath);
+				assert.equal(event.resource.fsPath, source.fsPath);
 				assert.equal(event.operation, FileOperation.MOVE);
 				assert.equal(event.target!.resource.fsPath, renamed.resource.fsPath);
 				toDispose.dispose();
@@ -446,28 +452,7 @@ suite('Disk File Service', () => {
 		});
 	});
 
-	test('moveFile', async () => {
-		let event: FileOperationEvent;
-		const toDispose = service.onAfterOperation(e => {
-			event = e;
-		});
-
-		const resource = URI.file(join(testDir, 'index.html'));
-		const source = await service.resolveFile(resource);
-
-		const renamed = await service.moveFile(source.resource, URI.file(join(testDir, 'other.html')));
-
-		assert.equal(existsSync(renamed.resource.fsPath), true);
-		assert.equal(existsSync(source.resource.fsPath), false);
-		assert.ok(event!);
-		assert.equal(event!.resource.fsPath, resource.fsPath);
-		assert.equal(event!.operation, FileOperation.MOVE);
-		assert.equal(event!.target!.resource.fsPath, renamed.resource.fsPath);
-
-		toDispose.dispose();
-	});
-
-	test('move - source parent of target', async () => {
+	test('moveFile - source parent of target', async () => {
 		let event: FileOperationEvent;
 		const toDispose = service.onAfterOperation(e => {
 			event = e;
@@ -483,7 +468,7 @@ suite('Disk File Service', () => {
 		}
 	});
 
-	test('move - FILE_MOVE_CONFLICT', async () => {
+	test('moveFile - FILE_MOVE_CONFLICT', async () => {
 		let event: FileOperationEvent;
 		const toDispose = service.onAfterOperation(e => {
 			event = e;
@@ -505,15 +490,14 @@ suite('Disk File Service', () => {
 			event = e;
 		});
 
-		const resource = URI.file(join(testDir, 'index.html'));
-		const source = await service.resolveFile(resource);
+		const source = URI.file(join(testDir, 'index.html'));
 
-		const renamed = await service.moveFile(source.resource, URI.file(join(testDir, 'INDEX.html')));
+		const renamed = await service.moveFile(source, URI.file(join(testDir, 'INDEX.html')));
 
 		assert.equal(existsSync(renamed.resource.fsPath), true);
 		assert.equal(basename(renamed.resource.fsPath), 'INDEX.html');
 		assert.ok(event!);
-		assert.equal(event!.resource.fsPath, resource.fsPath);
+		assert.equal(event!.resource.fsPath, source.fsPath);
 		assert.equal(event!.operation, FileOperation.MOVE);
 		assert.equal(event!.target!.resource.fsPath, renamed.resource.fsPath);
 
@@ -537,32 +521,151 @@ suite('Disk File Service', () => {
 		const parent = await service.resolveFile(URI.file(testDir));
 		const folderResource = URI.file(join(parent.resource.fsPath, 'conway.js'));
 		const f = await service.createFolder(folderResource);
-		const resource = URI.file(join(testDir, 'deep', 'conway.js'));
+		const source = URI.file(join(testDir, 'deep', 'conway.js'));
 
-		const moved = await service.moveFile(resource, f.resource, true);
+		const moved = await service.moveFile(source, f.resource, true);
 
 		assert.equal(existsSync(moved.resource.fsPath), true);
 		assert.ok(statSync(moved.resource.fsPath).isFile);
 		assert.ok(createEvent!);
 		assert.ok(deleteEvent!);
 		assert.ok(moveEvent!);
-		assert.equal(moveEvent!.resource.fsPath, resource.fsPath);
+		assert.equal(moveEvent!.resource.fsPath, source.fsPath);
 		assert.equal(moveEvent!.target!.resource.fsPath, moved.resource.fsPath);
 		assert.equal(deleteEvent!.resource.fsPath, folderResource.fsPath);
 
 		toDispose.dispose();
 	});
 
-	test('copyFile', async () => {
+	test('moveFile - across providers (buffered => buffered)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+		setCapabilities(testProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+
+		await testMoveAcrossProviders();
+	});
+
+	test('moveFile - across providers (unbuffered => unbuffered)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileReadWrite);
+		setCapabilities(testProvider, FileSystemProviderCapabilities.FileReadWrite);
+
+		await testMoveAcrossProviders();
+	});
+
+	test('moveFile - across providers (buffered => unbuffered)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+		setCapabilities(testProvider, FileSystemProviderCapabilities.FileReadWrite);
+
+		await testMoveAcrossProviders();
+	});
+
+	test('moveFile - across providers (unbuffered => buffered)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileReadWrite);
+		setCapabilities(testProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+
+		await testMoveAcrossProviders();
+	});
+
+	test('moveFile - across providers - large (buffered => buffered)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+		setCapabilities(testProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+
+		await testMoveAcrossProviders('lorem.txt');
+	});
+
+	test('moveFile - across providers - large (unbuffered => unbuffered)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileReadWrite);
+		setCapabilities(testProvider, FileSystemProviderCapabilities.FileReadWrite);
+
+		await testMoveAcrossProviders('lorem.txt');
+	});
+
+	test('moveFile - across providers - large (buffered => unbuffered)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+		setCapabilities(testProvider, FileSystemProviderCapabilities.FileReadWrite);
+
+		await testMoveAcrossProviders('lorem.txt');
+	});
+
+	test('moveFile - across providers - large (unbuffered => buffered)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileReadWrite);
+		setCapabilities(testProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+
+		await testMoveAcrossProviders('lorem.txt');
+	});
+
+	async function testMoveAcrossProviders(sourceFile = 'index.html'): Promise<void> {
 		let event: FileOperationEvent;
 		const toDispose = service.onAfterOperation(e => {
 			event = e;
 		});
 
-		const source = await service.resolveFile(URI.file(join(testDir, 'index.html')));
-		const resource = URI.file(join(testDir, 'other.html'));
+		const source = URI.file(join(testDir, sourceFile));
+		const sourceContents = readFileSync(source.fsPath);
 
-		const copied = await service.copyFile(source.resource, resource);
+		const target = URI.file(join(dirname(source.fsPath), 'other.html')).with({ scheme: testSchema });
+
+		const renamed = await service.moveFile(source, target);
+
+		assert.equal(existsSync(renamed.resource.fsPath), true);
+		assert.equal(existsSync(source.fsPath), false);
+		assert.ok(event!);
+		assert.equal(event!.resource.fsPath, source.fsPath);
+		assert.equal(event!.operation, FileOperation.MOVE);
+		assert.equal(event!.target!.resource.fsPath, renamed.resource.fsPath);
+
+		const targetContents = readFileSync(target.fsPath);
+
+		assert.equal(sourceContents.byteLength, targetContents.byteLength);
+		assert.equal(sourceContents.toString(), targetContents.toString());
+
+		toDispose.dispose();
+	}
+
+	test('copyFile', async () => {
+		await doTestCopyFile();
+	});
+
+	test('copyFile - unbuffered (FileSystemProviderCapabilities.FileReadWrite)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileReadWrite);
+
+		await doTestCopyFile();
+	});
+
+	test('copyFile - unbuffered large (FileSystemProviderCapabilities.FileReadWrite)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileReadWrite);
+
+		await doTestCopyFile('lorem.txt');
+	});
+
+	test('copyFile - buffered (FileSystemProviderCapabilities.FileOpenReadWriteClose)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+
+		await doTestCopyFile();
+	});
+
+	test('copyFile - buffered large (FileSystemProviderCapabilities.FileOpenReadWriteClose)', async () => {
+		setCapabilities(fileProvider, FileSystemProviderCapabilities.FileOpenReadWriteClose);
+
+		await doTestCopyFile('lorem.txt');
+	});
+
+	function setCapabilities(provider: TestDiskFileSystemProvider, capabilities: FileSystemProviderCapabilities): void {
+		provider.capabilities = capabilities;
+		if (isLinux) {
+			provider.capabilities |= FileSystemProviderCapabilities.PathCaseSensitive;
+		}
+	}
+
+	async function doTestCopyFile(sourceName: string = 'index.html') {
+		let event: FileOperationEvent;
+		const toDispose = service.onAfterOperation(e => {
+			event = e;
+		});
+
+		const source = await service.resolveFile(URI.file(join(testDir, sourceName)));
+		const target = URI.file(join(testDir, 'other.html'));
+
+		const copied = await service.copyFile(source.resource, target);
 
 		assert.equal(existsSync(copied.resource.fsPath), true);
 		assert.equal(existsSync(source.resource.fsPath), true);
@@ -570,8 +673,15 @@ suite('Disk File Service', () => {
 		assert.equal(event!.resource.fsPath, source.resource.fsPath);
 		assert.equal(event!.operation, FileOperation.COPY);
 		assert.equal(event!.target!.resource.fsPath, copied.resource.fsPath);
+
+		const sourceContents = readFileSync(source.resource.fsPath);
+		const targetContents = readFileSync(target.fsPath);
+
+		assert.equal(sourceContents.byteLength, targetContents.byteLength);
+		assert.equal(sourceContents.toString(), targetContents.toString());
+
 		toDispose.dispose();
-	});
+	}
 
 	test('copyFile - overwrite folder with file', async () => {
 		let createEvent: FileOperationEvent;
@@ -590,16 +700,16 @@ suite('Disk File Service', () => {
 		const parent = await service.resolveFile(URI.file(testDir));
 		const folderResource = URI.file(join(parent.resource.fsPath, 'conway.js'));
 		const f = await service.createFolder(folderResource);
-		const resource = URI.file(join(testDir, 'deep', 'conway.js'));
+		const source = URI.file(join(testDir, 'deep', 'conway.js'));
 
-		const copied = await service.copyFile(resource, f.resource, true);
+		const copied = await service.copyFile(source, f.resource, true);
 
 		assert.equal(existsSync(copied.resource.fsPath), true);
 		assert.ok(statSync(copied.resource.fsPath).isFile);
 		assert.ok(createEvent!);
 		assert.ok(deleteEvent!);
 		assert.ok(copyEvent!);
-		assert.equal(copyEvent!.resource.fsPath, resource.fsPath);
+		assert.equal(copyEvent!.resource.fsPath, source.fsPath);
 		assert.equal(copyEvent!.target!.resource.fsPath, copied.resource.fsPath);
 		assert.equal(deleteEvent!.resource.fsPath, folderResource.fsPath);
 
@@ -611,6 +721,7 @@ suite('Disk File Service', () => {
 		const renamed = await service.moveFile(source.resource, URI.file(join(dirname(source.resource.fsPath), 'CONWAY.js')));
 		assert.equal(existsSync(renamed.resource.fsPath), true);
 		assert.ok(readdirSync(testDir).some(f => f === 'CONWAY.js'));
+
 		const source_1 = await service.resolveFile(URI.file(join(testDir, 'deep', 'conway.js')));
 		const targetParent = URI.file(testDir);
 		const target = targetParent.with({ path: posix.join(targetParent.path, posix.basename(source_1.resource.path)) });
